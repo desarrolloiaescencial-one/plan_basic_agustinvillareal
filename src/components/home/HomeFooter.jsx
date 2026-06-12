@@ -157,7 +157,7 @@ export default function HomeFooter() {
 
           {/* Der: legal */}
           <div style={{ display:'flex', alignItems:'center', gap:'1.25rem' }}>
-            {['V1.1.1'].map(t => (
+            {['V1.1.2'].map(t => (
               <span key={t} style={{ fontFamily:"'DM Sans',sans-serif", fontSize:'.72rem', color:'rgba(255,255,255,.22)', cursor:'pointer', transition:'color .18s' }}
                 onMouseEnter={e=>{ e.currentTarget.style.color='rgba(255,255,255,.5)' }}
                 onMouseLeave={e=>{ e.currentTarget.style.color='rgba(255,255,255,.22)' }}>
