@@ -1001,3 +1001,9 @@ body:has(.sh-in) {
   .rk-podio-grid { grid-template-columns: 1fr !important; }
   .rk-partido-row { grid-template-columns: 1fr 58px 58px 50px; }
 }
+
+/* Podio responsive — data-count override */
+@media (max-width: 720px) {
+  .rk-podio-grid[data-count="2"] { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; max-width: 320px !important; }
+  .rk-podio-grid[data-count="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; max-width: 100% !important; }
+}
