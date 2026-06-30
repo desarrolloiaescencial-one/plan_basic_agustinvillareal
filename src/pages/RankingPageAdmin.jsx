@@ -13,6 +13,8 @@ import sheetsApi from '../services/sheetsApi.js'
 /* ─── helpers ─── */
 function isOpen(b)   { return b.estado==='abierta' && new Date(b.fecha_cierre)>Date.now() }
 function initials(n) { return (n||'').trim().split(/\s+/).slice(0,2).map(w=>w[0]?.toUpperCase()||'').join('')||'?' }
+function _numPred(v) { if (v === '' || v == null) return -1; const n = parseInt(v, 10); return isNaN(n) ? -1 : n }
+function _cod(v)     { return String(v == null ? '' : v).toUpperCase().trim() }
 
 /* ─── estilos globales ─── */
 const CSS = `
@@ -104,6 +106,150 @@ export default function RankingPageAdmin() {
   const [globalDetailUserId, setGlobalDetailUserId] = useState(null)
   const [globalDetailApuestas, setGlobalDetailApuestas] = useState({})
   const [globalDetailLoading, setGlobalDetailLoading]   = useState(null)
+
+  // Reconteo de apuesta (estadísticas destacadas)
+  const [estad, setEstad]               = useState(null)
+  const [estadLoading, setEstadLoading] = useState(false)
+  const [estadError, setEstadError]     = useState(null)
+  const [cardDetalle, setCardDetalle]   = useState(null)
+
+  // Reconteo calculado 100% en el FRONTEND (sin endpoint nuevo en el backend).
+  // Usa endpoints viejos y estables: apuestas.obtener, partidos.listar,
+  // grupos.listar, predicciones.tablaGlobal, predicciones.deUsuario.
+  async function cargarEstad() {
+    setEstadLoading(true); setEstadError(null)
+    try {
+      // 1) Apuesta de fase de grupos
+      const grupoBet = (bets || []).find(b => /grupo/i.test(b.titulo || ''))
+      if (!grupoBet) throw new Error('No encontré la apuesta de "fase de grupos"')
+
+      // 2) Datos base en paralelo (incluye usuarios para mostrar el email)
+      const usuariosP = (sheetsApi.usuarios && typeof sheetsApi.usuarios.listar === 'function')
+        ? sheetsApi.usuarios.listar().catch(() => ({ usuarios: [] }))
+        : Promise.resolve({ usuarios: [] })
+      const [apRes, partRes, grRes, glRes, usrRes] = await Promise.all([
+        sheetsApi.apuestas.obtener(grupoBet.id),
+        sheetsApi.partidos.listar(),
+        sheetsApi.grupos.listar(),
+        sheetsApi.predicciones.tablaGlobal({ limit: 300 }),
+        usuariosP,
+      ])
+      const betPartidos = (apRes.apuesta && apRes.apuesta.partidos) || []
+      const todos       = partRes.partidos || []
+      const gruposApi   = grRes.grupos || []
+      const ranking     = glRes.tabla || []
+      const emailById = {}
+      ;(usrRes.usuarios || []).forEach(u => { emailById[u.id] = u.email || '' })
+
+      // 3) Estructuras
+      const mapPart = {}
+      betPartidos.forEach(p => { mapPart[p.id] = p })
+
+      const groupMatchCount = {}
+      betPartidos.forEach(p => {
+        if (!p.es_eliminatoria && p.grupo) {
+          const g = _cod(p.grupo); groupMatchCount[g] = (groupMatchCount[g] || 0) + 1
+        }
+      })
+
+      const realSet = {}
+      todos.forEach(p => {
+        if (p.es_eliminatoria) {
+          const l = _cod(p.codigo_local), v = _cod(p.codigo_visitante)
+          if (l) realSet[l] = true; if (v) realSet[v] = true
+        }
+      })
+      const totalReal = Object.keys(realSet).length
+
+      const equiposPorGrupo = {}
+      gruposApi.forEach(g => {
+        const letra = _cod(g.letra)
+        equiposPorGrupo[letra] = (g.selecciones || []).slice()
+          .sort((a, b) => (a.pos || 99) - (b.pos || 99)).map(s => _cod(s.codigo))
+      })
+
+      // 4) Predicciones de grupos de cada usuario (en paralelo)
+      const conPreds = await Promise.all(ranking.map(u =>
+        sheetsApi.predicciones.deUsuario(grupoBet.id, u.user_id)
+          .then(r => ({ u, preds: r.mis || r.predicciones || [] }))
+          .catch(() => ({ u, preds: [] }))
+      ))
+
+      // 5) Cálculo por usuario
+      const lista = conPreds.map(({ u, preds }) => {
+        const tablas = {}, predCount = {}
+        let argentina = 0
+        preds.forEach(pr => {
+          const p = mapPart[pr.partido_id]; if (!p) return
+          const pl = _numPred(pr.pred_local), pv = _numPred(pr.pred_visitante)
+          const gl = _numPred(p.goles_local), gv = _numPred(p.goles_visitante)
+          const cl = _cod(p.codigo_local), cv = _cod(p.codigo_visitante)
+          // Argentina: resultado exacto
+          if (gl >= 0 && gv >= 0 && pl >= 0 && pv >= 0 && pl === gl && pv === gv && (cl === 'ARG' || cv === 'ARG')) argentina++
+          // Tabla de grupos predicha
+          if (!p.es_eliminatoria && p.grupo && cl && cv && pl >= 0 && pv >= 0) {
+            const g = _cod(p.grupo)
+            predCount[g] = (predCount[g] || 0) + 1
+            if (!tablas[g]) tablas[g] = {}
+            const tg = tablas[g]
+            if (!tg[cl]) tg[cl] = { pts: 0, gf: 0, gc: 0 }
+            if (!tg[cv]) tg[cv] = { pts: 0, gf: 0, gc: 0 }
+            tg[cl].gf += pl; tg[cl].gc += pv; tg[cv].gf += pv; tg[cv].gc += pl
+            if (pl > pv) tg[cl].pts += 3; else if (pv > pl) tg[cv].pts += 3; else { tg[cl].pts++; tg[cv].pts++ }
+          }
+        })
+        // Clasificados: equipos que predijo que clasificaban (2 por grupo COMPLETO
+        // + mejores 3ros) ∩ los 32 reales. + efectividad = aciertos / predichos.
+        const predichos = {}; const terceros = []
+        Object.keys(equiposPorGrupo).forEach(letra => {
+          const total = groupMatchCount[letra] || 0
+          if (total === 0 || (predCount[letra] || 0) < total) return
+          const s = equiposPorGrupo[letra].map(cod => {
+            const t = (tablas[letra] && tablas[letra][cod]) || { pts: 0, gf: 0, gc: 0 }
+            return { cod, pts: t.pts, dif: t.gf - t.gc, gf: t.gf }
+          })
+          s.sort((a, b) => b.pts - a.pts || b.dif - a.dif || b.gf - a.gf)
+          if (s[0]) predichos[s[0].cod] = 1
+          if (s[1]) predichos[s[1].cod] = 1
+          if (s[2]) terceros.push(s[2])
+        })
+        terceros.sort((a, b) => b.pts - a.pts || b.dif - a.dif || b.gf - a.gf)
+        const cupos3 = Math.max(0, totalReal - Object.keys(predichos).length)
+        terceros.slice(0, cupos3).forEach(t => predichos[t.cod] = 1)
+        const equiposPredichos = Object.keys(predichos)
+        let clasificados = 0
+        equiposPredichos.forEach(c => { if (realSet[c]) clasificados++ })
+        const efect = equiposPredichos.length ? clasificados / equiposPredichos.length : 0
+        return { nombre: u.nombre, email: emailById[u.user_id] || '', puntos: parseInt(u.puntos_totales, 10) || 0, argentina, clasificados, efect }
+      })
+
+      // 6) Destacados + detalle (Top 10). Clasificados desempata por efectividad.
+      const topN = (campo, tie) => lista.slice()
+        .sort((a, b) => b[campo] - a[campo] || (tie ? b[tie] - a[tie] : 0))
+        .slice(0, 10).map(u => ({ nombre: u.nombre, email: u.email, valor: u[campo] }))
+      const tPuntos = topN('puntos'), tArg = topN('argentina'), tClas = topN('clasificados', 'efect')
+      setEstad({
+        total_participantes: lista.length,
+        destacados: {
+          max_puntos:   tPuntos[0] || { nombre: 'Sin datos', email: '', valor: 0 },
+          campeon:      { nombre: 'Por Definirse', email: '', valor: null },
+          argentina:    tArg[0]   || { nombre: 'Sin datos', email: '', valor: 0 },
+          clasificados: tClas[0]  || { nombre: 'Sin datos', email: '', valor: 0 },
+        },
+        detalle: { puntos: tPuntos, argentina: tArg, clasificados: tClas },
+      })
+    } catch (e) {
+      setEstadError(e?.message || String(e))
+    } finally {
+      setEstadLoading(false)
+    }
+  }
+
+  async function irAReconteo() {
+    setModo('reconteo'); setSel(null); setExpandedUser(null)
+    if (estad || estadLoading) return
+    cargarEstad()
+  }
 
   useEffect(() => {
     let cancel = false
@@ -229,12 +375,16 @@ export default function RankingPageAdmin() {
           }}>
             {modo === 'global' ? (
               <><span style={{color:'#0c182b'}}>RANKING </span><span style={{color:'#ebc32b'}}>GLOBAL</span></>
+            ) : modo === 'reconteo' ? (
+              <><span style={{color:'#0c182b'}}>RECONTEO </span><span style={{color:'#ebc32b'}}>DE APUESTA</span></>
             ) : (
               <><span style={{color:'#0c182b'}}>RANKING </span><span style={{color:'#ebc32b'}}>ADMIN</span></>
             )}
           </h1>
           <p style={{ fontSize:'.84rem', color:'#5f6e8a', margin:0 }}>
-            {modo === 'global' ? 'Suma de puntos en todas las apuestas' : (sel ? sel.titulo : 'Seleccioná una apuesta para ver el detalle')}
+            {modo === 'global' ? 'Suma de puntos en todas las apuestas'
+              : modo === 'reconteo' ? 'Estadísticas destacadas · tocá una tarjeta para ver el detalle'
+              : (sel ? sel.titulo : 'Seleccioná una apuesta para ver el detalle')}
           </p>
         </div>
 
@@ -265,6 +415,21 @@ export default function RankingPageAdmin() {
                 </svg>
               </div>
 
+              <div className={`rk-row${modo==='reconteo'?' sel':''}`} onClick={irAReconteo}>
+                <div style={{width:7,height:7,borderRadius:'50%',background:'#3b82f6',flexShrink:0}}/>
+                <div style={{flex:1,minWidth:0}}>
+                  <p style={{fontSize:12,fontWeight:600,color:modo==='reconteo'?'#fff':'#0c182b',margin:'0 0 2px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                    Reconteo de apuesta
+                  </p>
+                  <p style={{fontSize:10,color:'#94a3b8',margin:0}}>
+                    Estadísticas destacadas
+                  </p>
+                </div>
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={modo==='reconteo'?'#ebc32b':'#c8d0dc'} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="9 18 15 12 9 6"/>
+                </svg>
+              </div>
+
               {lb ? (
                 <div style={{padding:12,display:'flex',flexDirection:'column',gap:4}}>
                   {[...Array(6)].map((_,i)=><div key={i} className="rk-sk" style={{height:52}}/>)}
@@ -290,7 +455,16 @@ export default function RankingPageAdmin() {
 
           <div className="rk-content" style={{padding:'24px 32px 32px'}}>
 
-            {modo==='global' ? (
+            {modo==='reconteo' ? (
+              <VistaReconteo
+                estad={estad}
+                loading={estadLoading}
+                error={estadError}
+                onRetry={cargarEstad}
+                cardDetalle={cardDetalle}
+                setCardDetalle={setCardDetalle}
+              />
+            ) : modo==='global' ? (
               <VistaGlobal
                 gTabla={gTabla}
                 gMeta={gMeta}
@@ -1136,6 +1310,106 @@ function BetsPanel({ apuestas, loading }) {
           <span style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:16,color:'#0c182b'}}>{totalPts} pts en {apuestas.length} apuestas</span>
         </div>
       </div>
+    </div>
+  )
+}
+
+/* ══════════════════════════════════════════
+   VISTA RECONTEO DE APUESTA (4 tarjetas + detalle)
+══════════════════════════════════════════ */
+const RECONTEO_CFG = [
+  { key:'max_puntos',   color:'#ebc32b', emoji:'🥇', label:'Máxima Puntuación',       unit:'puntos',      badge:'EN JUEGO',  det:'puntos' },
+  { key:'campeon',      color:'#a855f7', emoji:'👑', label:'Acertó Campeón',          unit:'',            badge:'PENDIENTE', det:null },
+  { key:'argentina',    color:'#3b82f6', emoji:'🇦🇷', label:'Más Aciertos Argentina',  unit:'aciertos',    badge:'EN JUEGO',  det:'argentina' },
+  { key:'clasificados', color:'#22c55e', emoji:'⚽', label:'Más Clasificados',        unit:'clasificados', badge:'DEFINIDO',  det:'clasificados' },
+]
+
+function VistaReconteo({ estad, loading, error, onRetry, cardDetalle, setCardDetalle }) {
+  if (loading) return <SkeletonContent/>
+
+  if (error) {
+    return (
+      <div style={{textAlign:'center',padding:'40px 24px',background:'#fff',borderRadius:14,border:'1.5px solid rgba(244,63,94,.3)'}}>
+        <p style={{fontWeight:700,color:'#f43f5e',margin:'0 0 8px',fontSize:15}}>No se pudo cargar el reconteo</p>
+        <p style={{fontSize:12,color:'#94a3b8',margin:'0 0 4px'}}>El backend respondió:</p>
+        <p style={{fontSize:13,color:'#0c182b',fontWeight:600,margin:'0 0 16px',fontFamily:'monospace',background:'#faf7f0',border:'1px solid #f0eadb',borderRadius:8,padding:'8px 12px',display:'inline-block',maxWidth:'100%',wordBreak:'break-word'}}>{error}</p>
+        <div>
+          <button onClick={onRetry} className="rk-detail-btn rk-detail-btn-podio">Reintentar</button>
+        </div>
+        <p style={{fontSize:11,color:'#a8b2c4',margin:'14px 0 0',lineHeight:1.6}}>
+          Si dice <b>"Acción GET desconocida"</b> → falta el <code>case</code> en <code>routeGet_</code> o no redeployaste el Apps Script.
+        </p>
+      </div>
+    )
+  }
+
+  if (!estad) return <SinParticipantes/>
+
+  const d = estad.destacados || {}
+  const det = estad.detalle || {}
+
+  return (
+    <div className="rk-in">
+      <div style={{borderRadius:14,marginBottom:24,background:'linear-gradient(125deg,#0c182b 0%,#1a3060 100%)',padding:'18px 22px',position:'relative',overflow:'hidden'}}>
+        <div style={{position:'absolute',top:-30,right:-30,width:180,height:180,borderRadius:'50%',background:'rgba(235,195,43,.08)',pointerEvents:'none'}}/>
+        <span style={{fontSize:9,fontWeight:800,textTransform:'uppercase',letterSpacing:'.22em',color:'rgba(235,195,43,.55)',display:'block',marginBottom:4}}>RECONTEO DE APUESTA</span>
+        <h2 style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:'clamp(22px,3vw,32px)',color:'#fff',margin:'0 0 4px',letterSpacing:'.02em',lineHeight:1}}>Estadísticas destacadas</h2>
+        <p style={{fontSize:10,color:'rgba(255,255,255,.45)',margin:0}}>{estad.total_participantes} participantes · empate → quien apostó primero</p>
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(230px,1fr))',gap:14}}>
+        {RECONTEO_CFG.map(cfg => (
+          <StatCardReconteo
+            key={cfg.key}
+            cfg={cfg}
+            dest={d[cfg.key]}
+            detalle={cfg.det ? det[cfg.det] : null}
+            open={cardDetalle===cfg.key}
+            onToggle={()=>setCardDetalle(cardDetalle===cfg.key?null:cfg.key)}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function StatCardReconteo({ cfg, dest, detalle, open, onToggle }) {
+  const valor = dest?.valor
+  const tieneDetalle = Array.isArray(detalle) && detalle.length > 0
+  const badgeColor = cfg.badge==='DEFINIDO' ? '#3b82f6' : cfg.badge==='PENDIENTE' ? '#f59e0b' : '#22c55e'
+
+  return (
+    <div style={{background:'#fff',border:'1px solid #e8e3db',borderTop:`4px solid ${cfg.color}`,borderRadius:14,padding:'18px 18px 14px',boxShadow:'0 2px 12px rgba(12,24,43,.05)'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+        <div style={{width:40,height:40,borderRadius:11,background:`${cfg.color}1a`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:20}}>{cfg.emoji}</div>
+        <span style={{fontSize:9,fontWeight:800,letterSpacing:'.06em',color:badgeColor,background:`${badgeColor}15`,border:`1px solid ${badgeColor}30`,padding:'3px 8px',borderRadius:99}}>{cfg.badge}</span>
+      </div>
+      <p style={{fontSize:10,fontWeight:800,textTransform:'uppercase',letterSpacing:'.1em',color:'#94a3b8',margin:'0 0 6px'}}>{cfg.label}</p>
+      <p style={{fontSize:16,fontWeight:700,color:'#0c182b',margin:'0 0 2px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{dest?.nombre || 'Sin datos'}</p>
+      {dest?.email ? <p style={{fontSize:10,color:'#94a3b8',margin:'0 0 8px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{dest.email}</p> : <div style={{height:8}}/>}
+      <p style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:34,lineHeight:1,color:cfg.color,margin:'0 0 4px'}}>{valor==null?'—':valor}</p>
+      <p style={{fontSize:11,color:'#94a3b8',margin:0}}>{cfg.unit || 'Se define en la Final (28/07)'}</p>
+
+      {tieneDetalle && (
+        <button onClick={onToggle} className={`rk-detail-btn rk-detail-btn-podio ${open?'active':''}`} style={{width:'100%',marginTop:12}}>
+          {open ? 'Ocultar detalle' : 'Ver detalle (Top 10)'}
+        </button>
+      )}
+
+      {open && tieneDetalle && (
+        <div style={{marginTop:10,borderTop:'1px solid #f0eadb',paddingTop:8,display:'flex',flexDirection:'column',gap:3}}>
+          {detalle.map((u,i)=>(
+            <div key={i} style={{display:'flex',alignItems:'center',gap:8,padding:'4px 0'}}>
+              <span style={{width:20,height:20,borderRadius:6,background:i===0?cfg.color:'#eef1f5',color:i===0?'#fff':'#64748b',display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:800,flexShrink:0}}>{i+1}</span>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:12,fontWeight:600,color:'#0c182b',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{u.nombre}</div>
+                {u.email ? <div style={{fontSize:9,color:'#94a3b8',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{u.email}</div> : null}
+              </div>
+              <span style={{fontSize:12,fontWeight:800,color:cfg.color,flexShrink:0}}>{u.valor}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

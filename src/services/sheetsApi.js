@@ -281,6 +281,11 @@ const predicciones = {
   // Detalle de apuestas por usuario en el ranking global
   apuestasUsuario: (userId) =>
     get('predicciones.apuestas_usuario', { user_id: userId }, { useCache: false }),
+
+  // Reconteo de apuesta: estadísticas destacadas (máx. puntos, Argentina, clasificados)
+  // con su Top 10 de detalle. Devuelve: { total_participantes, destacados, detalle }
+  estadisticas: () =>
+    get('predicciones.estadisticas', {}, { useCache: false }),
 }
 
 const grupos = {
